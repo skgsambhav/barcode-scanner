@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Barcode Scanner</title>
+  <style>
+    :root { --b:#e9ecef; --t:#222; --ok:#0a7c2f; --err:#b00020; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 14px; color: var(--t); }
+    .box { border: 1px solid var(--b); border-radius: 12px; padding: 12px; margin-bottom: 12px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    video { width:100%; max-height:60vh; border-radius:12px; background:#000; }
+    button, select, input[type=file]{ padding:10px 12px; border-radius:8px; border:1px solid #ccc; }
+    .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .ok{ color: var(--ok); font-weight:600;}
+    .err{ color: var(--err); font-weight:600;}
+    #result{ white-space:pre-wrap; }
+  </style>
+</head>
+<body>
+  <h2>📷 Barcode Scanner</h2>
+
+  <div class="box">
+    <div class="row">
+      <select id="cameraSelect" title="Choose camera"></select>
+      <button id="startBtn">Start Camera</button>
+      <button id="stopBtn" disabled>Stop</button>
+    </div>
+    <div id="status" class="mono">Idle…</div>
+    <video id="preview" playsinline muted></video>
+  </div>
+
+  <div class="box">
+    <div><strong>Fallback:</strong> Upload a barcode photo (non-camera environments)</div>
+    <input id="fileInput" type="file" accept="image/*" capture="environment">
+  </div>
+
+  <div class="box">
+    <div><strong>Last Code:</strong> <span id="lastCode" class="mono">—</span></div>
+    <div id="lookup" class="mono"></div>
+    <div id="result"></div>
+  </div>
+
+  <!-- ZXing JS -->
+  <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/umd/index.min.js"></script>
+  <script>
+    const videoEl = document.getElementById('preview');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn  = document.getElementById('stopBtn');
+    const camSel   = document.getElementById('cameraSelect');
+    const statusEl = document.getElementById('status');
+    const lastCodeEl = document.getElementById('lastCode');
+    const lookupEl = document.getElementById('lookup');
+    const resultEl = document.getElementById('result');
+    const fileInput = document.getElementById('fileInput');
+
+    const { BrowserMultiFormatReader, BrowserBarcodeReader, NotFoundException } = ZXing;
+    const reader = new BrowserMultiFormatReader();
+    let controls = null;
+
+    async function listCameras() {
+      try {
+        const devices = await reader.listVideoInputDevices();
+        camSel.innerHTML = '';
+        devices.forEach((d,i)=>{
+          const opt = document.createElement('option');
+          opt.value = d.deviceId;
+          opt.textContent = d.label || `Camera ${i+1}`;
+          camSel.appendChild(opt);
+        });
+      } catch(e){ console.error(e); }
+    }
+
+    async function start() {
+      try {
+        statusEl.textContent = "Starting camera…";
+        controls = await reader.decodeFromVideoDevice(camSel.value || undefined, videoEl, (res, err) => {
+          if (res) handleCode(res.getText());
+          else if (err && !(err instanceof NotFoundException)) console.warn(err);
+        });
+        startBtn.disabled = true; stopBtn.disabled = false;
+        statusEl.textContent = "Scanning…";
+      } catch(e){
+        console.error(e);
+        statusEl.textContent = "Camera start failed. Use photo fallback.";
+      }
+    }
+
+    function stop() {
+      try { if (controls) controls.stop(); } catch(e){}
+      startBtn.disabled = false; stopBtn.disabled = true;
+      statusEl.textContent = "Stopped.";
+    }
+
+    async function handleCode(code) {
+      stop(); // first match par stop; continuous chahiye to is line ko hata do
+      lastCodeEl.textContent = code;
+      lookupEl.textContent = "Searching in DB…";
+      resultEl.textContent = "";
+      try {
+        const r = await fetch(`/api/search?code=${encodeURIComponent(code)}`);
+        const j = await r.json();
+        if (!j.ok || !j.found) {
+          lookupEl.innerHTML = `<span class="err">Not found</span> (code: <span class="mono">${code}</span>)`;
+          return;
+        }
+        lookupEl.innerHTML = `<span class="ok">Matched</span> (id: ${j.data.id})`;
+        resultEl.textContent =
+          `Name: ${j.data.name}\nBarcode: ${j.data.barcode}\nSKU: ${j.data.sku}\nPrice: ₹${j.data.price}`;
+      } catch (e) {
+        lookupEl.innerHTML = `<span class="err">Lookup failed</span>`;
+      }
+    }
+
+    // Fallback: decode from uploaded image
+    fileInput.addEventListener('change', async (ev) => {
+      const file = ev.target.files?.[0];
+      if (!file) return;
+      const img = new Image();
+      img.onload = async () => {
+        try {
+          const res = await BrowserBarcodeReader.decodeFromImageElement(img);
+          handleCode(res.getText());
+        } catch (e) {
+          lookupEl.innerHTML = `<span class="err">No barcode detected in image</span>`;
+        }
+      };
+      img.src = URL.createObjectURL(file);
+    });
+
+    listCameras();
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+  </script>
+</body>
+</html>
