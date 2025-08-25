@@ -1,44 +1,309 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>Mobile Scanner</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Barcode Scanner</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 12px; }
+    .wrap { max-width: 520px; margin: 0 auto; }
+    video { width: 100%; border-radius: 12px; background:#000; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+    button, select, input[type=file] {
+      padding: 10px 12px; border-radius: 10px; border: 1px solid #ccc; background: #f7f7f7; cursor: pointer;
+    }
+    #status { font-size: 14px; color: #666; margin-top: 6px; }
+    #result { margin-top: 10px; padding: 10px; border-radius: 10px; background: #eef9ee; border: 1px solid #cde8cd; word-break: break-word; }
+    .muted { color:#666; font-size:12px; }
+    canvas { display:none; }
+  </style>
+  <!-- ZXing (UMD) -->
+  <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/umd/index.min.js"></script>
 </head>
 <body>
+<div class="wrap">
   <h2>Scan Barcode</h2>
-  <video id="camera" autoplay playsinline style="width:100%; max-width:400px;"></video>
-  <input type="file" id="photoInput" accept="image/*" capture="environment" style="display:none;">
-  <button id="startBtn">📷 Start Camera</button>
-  <button id="photoBtn" style="display:none;">📸 Upload Photo</button>
 
-  <script>
-    const startBtn = document.getElementById("startBtn");
-    const photoBtn = document.getElementById("photoBtn");
-    const camera = document.getElementById("camera");
-    const photoInput = document.getElementById("photoInput");
+  <video id="preview" playsinline muted></video>
+  <div class="row">
+    <button id="startBtn">Start Camera</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <button id="torchBtn" disabled>🔦 Torch</button>
+    <select id="cameraSelect" style="flex:1; min-width:160px;" title="Choose camera"></select>
+  </div>
 
-    startBtn.addEventListener("click", async () => {
+  <div class="row">
+    <input id="photoInput" type="file" accept="image/*" capture="environment" />
+    <button id="scanPhotoBtn">Scan Photo</button>
+  </div>
+
+  <div id="status" class="muted">Idle</div>
+  <div id="result" style="display:none;"></div>
+
+  <canvas id="scratch"></canvas>
+</div>
+
+<script>
+(function(){
+  const videoEl = document.getElementById('preview');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const torchBtn = document.getElementById('torchBtn');
+  const cameraSelect = document.getElementById('cameraSelect');
+  const statusEl = document.getElementById('status');
+  const resultEl = document.getElementById('result');
+  const photoInput = document.getElementById('photoInput');
+  const scanPhotoBtn = document.getElementById('scanPhotoBtn');
+  const scratch = document.getElementById('scratch');
+
+  let codeReader = null;
+  let currentDeviceId = null;
+  let currentStream = null;
+  let torchOn = false;
+
+  // Speed up by hinting formats you expect
+  const formats = [
+    ZXing.BarcodeFormat.CODE_128,
+    ZXing.BarcodeFormat.EAN_13,
+    ZXing.BarcodeFormat.EAN_8,
+    ZXing.BarcodeFormat.UPC_A,
+    ZXing.BarcodeFormat.UPC_E,
+    ZXing.BarcodeFormat.ITF,
+    ZXing.BarcodeFormat.QR_CODE,
+    ZXing.BarcodeFormat.PDF_417
+  ];
+  const hints = new Map();
+  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+  function showResult(text) {
+    resultEl.style.display = 'block';
+    resultEl.textContent = text;
+  }
+
+  async function listCameras() {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const videoInputs = devices.filter(d => d.kind === 'videoinput');
+    cameraSelect.innerHTML = '';
+    videoInputs.forEach((d, i) => {
+      const opt = document.createElement('option');
+      opt.value = d.deviceId;
+      // Prefer back camera labels; otherwise show index
+      opt.text = d.label || `Camera ${i+1}`;
+      cameraSelect.appendChild(opt);
+    });
+    if (videoInputs.length) {
+      // Prefer environment camera if we can detect it
+      const env = videoInputs.find(d => /back|rear|environment/i.test(d.label));
+      cameraSelect.value = (env && env.deviceId) || videoInputs[0].deviceId;
+    }
+  }
+
+  async function stopStream() {
+    if (currentStream) {
+      currentStream.getTracks().forEach(t => t.stop());
+      currentStream = null;
+    }
+    if (codeReader) {
+      try { codeReader.reset(); } catch(e){}
+    }
+    stopBtn.disabled = true;
+    torchBtn.disabled = true;
+    torchOn = false;
+  }
+
+  async function applyAdvancedConstraints() {
+    if (!currentStream) return;
+    const track = currentStream.getVideoTracks()[0];
+    if (!track) return;
+
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    const cons = track.getConstraints ? track.getConstraints() : {};
+
+    const advanced = [];
+
+    // Try continuous autofocus
+    if (caps.focusMode && caps.focusMode.includes('continuous')) {
+      advanced.push({ focusMode: 'continuous' });
+    }
+    // Try some zoom for better decode if supported
+    if ('zoom' in caps) {
+      // middle of the range
+      const midZoom = (caps.zoom.min + caps.zoom.max) / 3;
+      advanced.push({ zoom: midZoom });
+    }
+    // Prefer high resolution if not already set
+    if (!cons.width && caps.width && caps.height) {
+      advanced.push({ width: { ideal: Math.min(1280, caps.width.max || 1280) },
+                      height:{ ideal: Math.min(720, caps.height.max || 720) }});
+    }
+
+    if (advanced.length) {
+      try { await track.applyConstraints({ advanced }); } catch(e){}
+    }
+  }
+
+  async function toggleTorch() {
+    if (!currentStream) return;
+    const track = currentStream.getVideoTracks()[0];
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if (!('torch' in caps)) {
+      alert('Torch not supported on this device.');
+      return;
+    }
+    torchOn = !torchOn;
+    try {
+      await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+      torchBtn.textContent = torchOn ? '🔦 Torch ON' : '🔦 Torch';
+    } catch (e) {
+      alert('Torch toggle failed: ' + e.message);
+    }
+  }
+
+  async function startScan(deviceId) {
+    await stopStream();
+    setStatus('Starting camera…');
+
+    // Build constraints manually (gives us the stream for torch/constraints)
+    const constraints = {
+      audio: false,
+      video: {
+        deviceId: deviceId ? { exact: deviceId } : undefined,
+        facingMode: deviceId ? undefined : { ideal: 'environment' },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    };
+
+    currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+    videoEl.srcObject = currentStream;
+    await videoEl.play();
+    await applyAdvancedConstraints();
+
+    stopBtn.disabled = false;
+
+    // Enable torch button if supported
+    try {
+      const track = currentStream.getVideoTracks()[0];
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      if ('torch' in caps) {
+        torchBtn.disabled = false;
+      } else {
+        torchBtn.disabled = true;
+      }
+    } catch(e) { torchBtn.disabled = true; }
+
+    // Setup ZXing reader with hints
+    codeReader = new ZXing.BrowserMultiFormatReader(hints);
+
+    // Continuous decode loop using video element
+    setStatus('Looking for barcode…');
+    const tick = async () => {
+      if (!codeReader) return;
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-        camera.srcObject = stream;
+        const luminanceSource = new ZXing.HTMLCanvasElementLuminanceSource(
+          frameToCanvas(videoEl, scratch)
+        );
+        const binaryBitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminanceSource));
+        const result = codeReader.decode(binaryBitmap);
+        if (result && result.getText) {
+          const text = result.getText();
+          showResult(text);
+          setStatus('Detected ✔');
+          // Optional: beep or auto-stop
+          // await stopStream();
+        } else {
+          requestAnimationFrame(tick);
+        }
       } catch (err) {
-        console.error("Camera failed:", err);
-        alert("Camera not available. Please upload photo instead.");
-        photoBtn.style.display = "inline-block";
+        // NotFoundException means keep trying
+        if (err && err.name === 'NotFoundException') {
+          requestAnimationFrame(tick);
+        } else {
+          // Other errors, keep trying anyway
+          requestAnimationFrame(tick);
+        }
       }
-    });
+    };
+    requestAnimationFrame(tick);
+  }
 
-    photoBtn.addEventListener("click", () => {
-      photoInput.click();
-    });
+  // Draw current video frame into canvas (downscale to speed up)
+  function frameToCanvas(video, canvas) {
+    const maxW = 640; // downscale for speed; increase if small barcodes
+    const ratio = video.videoWidth / video.videoHeight || (16/9);
+    const w = Math.min(maxW, video.videoWidth || maxW);
+    const h = Math.round(w / ratio);
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(video, 0, 0, w, h);
+    return canvas;
+  }
 
-    photoInput.addEventListener("change", (e) => {
-      const file = e.target.files[0];
-      if (file) {
-        alert("Photo selected: " + file.name);
-        // TODO: send file to backend or run barcode scanner
+  async function scanImageFile(file) {
+    setStatus('Decoding photo…');
+    showResult(''); resultEl.style.display = 'none';
+
+    const img = new Image();
+    img.onload = async () => {
+      // Draw photo onto canvas (downscale if huge)
+      const maxW = 1600;
+      const scale = Math.min(1, maxW / img.width);
+      scratch.width = Math.round(img.width * scale);
+      scratch.height = Math.round(img.height * scale);
+      const ctx = scratch.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0, scratch.width, scratch.height);
+
+      try {
+        const luminance = new ZXing.HTMLCanvasElementLuminanceSource(scratch);
+        const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
+        const res = ZXing.MultiFormatReader.decodeWithState(new ZXing.MultiFormatReader());
+        // set hints
+        const reader = new ZXing.MultiFormatReader();
+        reader.setHints(hints);
+        const result = reader.decode(bitmap);
+        showResult(result.getText());
+        setStatus('Photo decoded ✔');
+      } catch (e) {
+        setStatus('No barcode found in photo.');
+        alert('Photo me barcode detect nahi hua. Thoda clear/close photo try karo.');
       }
-    });
-  </script>
+    };
+    img.onerror = () => setStatus('Could not load photo.');
+    img.src = URL.createObjectURL(file);
+  }
+
+  startBtn.addEventListener('click', async () => {
+    try {
+      await listCameras();
+      currentDeviceId = cameraSelect.value || null;
+      await startScan(currentDeviceId);
+    } catch (e) {
+      console.error(e);
+      setStatus('Camera start failed: ' + e.message);
+      alert('Camera start failed. Photo se scan try karo.');
+    }
+  });
+
+  stopBtn.addEventListener('click', stopStream);
+  torchBtn.addEventListener('click', toggleTorch);
+
+  cameraSelect.addEventListener('change', async (e) => {
+    currentDeviceId = e.target.value;
+    if (currentStream) await startScan(currentDeviceId);
+  });
+
+  scanPhotoBtn.addEventListener('click', async () => {
+    const f = photoInput.files && photoInput.files[0];
+    if (!f) { alert('Choose a photo first.'); return; }
+    await scanImageFile(f);
+  });
+
+  // iOS/Safari autoplay helper
+  document.addEventListener('touchstart', () => { if (videoEl.paused) videoEl.play().catch(()=>{}); }, { once:true });
+
+})();
+</script>
 </body>
 </html>
