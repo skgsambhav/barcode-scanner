@@ -1,308 +1,225 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Barcode Scanner</title>
-  <style>
-    body { font-family: system-ui, Arial, sans-serif; margin: 12px; }
-    .wrap { max-width: 520px; margin: 0 auto; }
-    video { width: 100%; border-radius: 12px; background:#000; }
-    .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
-    button, select, input[type=file] {
-      padding: 10px 12px; border-radius: 10px; border: 1px solid #ccc; background: #f7f7f7; cursor: pointer;
-    }
-    #status { font-size: 14px; color: #666; margin-top: 6px; }
-    #result { margin-top: 10px; padding: 10px; border-radius: 10px; background: #eef9ee; border: 1px solid #cde8cd; word-break: break-word; }
-    .muted { color:#666; font-size:12px; }
-    canvas { display:none; }
-  </style>
-  <!-- ZXing (UMD) -->
-  <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/umd/index.min.js"></script>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Ultra-Fast Barcode Scanner</title>
+<style>
+  :root { --w: 560px; }
+  body{font-family:system-ui,Arial,sans-serif;margin:12px}
+  .wrap{max-width:var(--w);margin:0 auto}
+  video{width:100%;border-radius:12px;background:#000}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+  button,select{padding:10px 12px;border-radius:10px;border:1px solid #ccc;background:#f7f7f7;cursor:pointer}
+  #status{font-size:12px;color:#666}
+  #result{margin-top:8px;padding:10px;border-radius:10px;background:#eef9ee;border:1px solid #cde8cd;word-break:break-word}
+  .aim{position:relative;margin-top:-50%;height:0;pointer-events:none}
+  .aim::after{content:"";display:block;padding-top:56.25%}
+  .box{position:absolute;left:10%;top:30%;right:10%;bottom:30%;
+       border:2px dashed rgba(255,255,255,.6);border-radius:12px}
+  canvas{display:none}
+</style>
 </head>
 <body>
 <div class="wrap">
-  <h2>Scan Barcode</h2>
+  <h2>Ultra-Fast Barcode Scanner</h2>
+  <video id="video" playsinline muted></video>
+  <div class="aim"><div class="box"></div></div>
 
-  <video id="preview" playsinline muted></video>
   <div class="row">
-    <button id="startBtn">Start Camera</button>
+    <button id="startBtn">Start</button>
     <button id="stopBtn" disabled>Stop</button>
     <button id="torchBtn" disabled>🔦 Torch</button>
-    <select id="cameraSelect" style="flex:1; min-width:160px;" title="Choose camera"></select>
+    <select id="cameraSelect" style="flex:1;min-width:160px"></select>
   </div>
 
-  <div class="row">
-    <input id="photoInput" type="file" accept="image/*" capture="environment" />
-    <button id="scanPhotoBtn">Scan Photo</button>
-  </div>
-
-  <div id="status" class="muted">Idle</div>
-  <div id="result" style="display:none;"></div>
+  <div id="status">Idle</div>
+  <div id="result" style="display:none"></div>
 
   <canvas id="scratch"></canvas>
 </div>
 
 <script>
-(function(){
-  const videoEl = document.getElementById('preview');
+(async () => {
+  const video = document.getElementById('video');
   const startBtn = document.getElementById('startBtn');
-  const stopBtn = document.getElementById('stopBtn');
+  const stopBtn  = document.getElementById('stopBtn');
   const torchBtn = document.getElementById('torchBtn');
-  const cameraSelect = document.getElementById('cameraSelect');
+  const camSel   = document.getElementById('cameraSelect');
   const statusEl = document.getElementById('status');
   const resultEl = document.getElementById('result');
-  const photoInput = document.getElementById('photoInput');
-  const scanPhotoBtn = document.getElementById('scanPhotoBtn');
-  const scratch = document.getElementById('scratch');
+  const scratch  = document.getElementById('scratch');
 
-  let codeReader = null;
-  let currentDeviceId = null;
-  let currentStream = null;
+  let stream = null;
+  let detector = null;     // BarcodeDetector or ZXing wrapper
+  let useNative = false;
+  let running = false;
   let torchOn = false;
 
-  // Speed up by hinting formats you expect
-  const formats = [
-    ZXing.BarcodeFormat.CODE_128,
-    ZXing.BarcodeFormat.EAN_13,
-    ZXing.BarcodeFormat.EAN_8,
-    ZXing.BarcodeFormat.UPC_A,
-    ZXing.BarcodeFormat.UPC_E,
-    ZXing.BarcodeFormat.ITF,
-    ZXing.BarcodeFormat.QR_CODE,
-    ZXing.BarcodeFormat.PDF_417
+  const wantedFormatsNative = [
+    'ean_13','ean_8','upc_a','upc_e','code_128','itf','qr_code','pdf417'
+  ]; // Native API names
+  const wantedFormatsZX = [ // ZXing enum names
+    'EAN_13','EAN_8','UPC_A','UPC_E','CODE_128','ITF','QR_CODE','PDF_417'
   ];
-  const hints = new Map();
-  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
 
-  function setStatus(msg) { statusEl.textContent = msg; }
-  function showResult(text) {
-    resultEl.style.display = 'block';
-    resultEl.textContent = text;
+  function setStatus(s){ statusEl.textContent = s; }
+  function showResult(txt){
+    resultEl.style.display='block';
+    resultEl.textContent = txt;
   }
 
-  async function listCameras() {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const videoInputs = devices.filter(d => d.kind === 'videoinput');
-    cameraSelect.innerHTML = '';
-    videoInputs.forEach((d, i) => {
-      const opt = document.createElement('option');
-      opt.value = d.deviceId;
-      // Prefer back camera labels; otherwise show index
-      opt.text = d.label || `Camera ${i+1}`;
-      cameraSelect.appendChild(opt);
+  async function listCameras(){
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const cams = devs.filter(d => d.kind === 'videoinput');
+    camSel.innerHTML = '';
+    cams.forEach((d,i)=>{
+      const o = document.createElement('option');
+      o.value = d.deviceId;
+      o.text  = d.label || `Camera ${i+1}`;
+      camSel.appendChild(o);
     });
-    if (videoInputs.length) {
-      // Prefer environment camera if we can detect it
-      const env = videoInputs.find(d => /back|rear|environment/i.test(d.label));
-      cameraSelect.value = (env && env.deviceId) || videoInputs[0].deviceId;
-    }
+    const env = cams.find(d => /back|rear|environment/i.test(d.label));
+    camSel.value = env?.deviceId || cams[0]?.deviceId || '';
   }
 
-  async function stopStream() {
-    if (currentStream) {
-      currentStream.getTracks().forEach(t => t.stop());
-      currentStream = null;
-    }
-    if (codeReader) {
-      try { codeReader.reset(); } catch(e){}
-    }
-    stopBtn.disabled = true;
-    torchBtn.disabled = true;
-    torchOn = false;
+  async function stop(){
+    running = false;
+    if (stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+    stopBtn.disabled = true; torchBtn.disabled = true; torchOn=false;
   }
 
-  async function applyAdvancedConstraints() {
-    if (!currentStream) return;
-    const track = currentStream.getVideoTracks()[0];
-    if (!track) return;
-
-    const caps = track.getCapabilities ? track.getCapabilities() : {};
-    const cons = track.getConstraints ? track.getConstraints() : {};
-
-    const advanced = [];
-
-    // Try continuous autofocus
-    if (caps.focusMode && caps.focusMode.includes('continuous')) {
-      advanced.push({ focusMode: 'continuous' });
+  async function applyTrackTuning(){
+    if (!stream) return;
+    const track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities?.() || {};
+    const adv = [];
+    if (caps.focusMode?.includes('continuous')) adv.push({focusMode:'continuous'});
+    if ('zoom' in caps){
+      const mid = (caps.zoom.min + (caps.zoom.max??caps.zoom.min))/2;
+      adv.push({zoom: Math.min(mid, caps.zoom.max||mid)});
     }
-    // Try some zoom for better decode if supported
-    if ('zoom' in caps) {
-      // middle of the range
-      const midZoom = (caps.zoom.min + caps.zoom.max) / 3;
-      advanced.push({ zoom: midZoom });
-    }
-    // Prefer high resolution if not already set
-    if (!cons.width && caps.width && caps.height) {
-      advanced.push({ width: { ideal: Math.min(1280, caps.width.max || 1280) },
-                      height:{ ideal: Math.min(720, caps.height.max || 720) }});
-    }
-
-    if (advanced.length) {
-      try { await track.applyConstraints({ advanced }); } catch(e){}
-    }
+    if (adv.length) { try{ await track.applyConstraints({advanced:adv}); }catch{} }
+    // Torch availability
+    torchBtn.disabled = !('torch' in caps);
   }
 
-  async function toggleTorch() {
-    if (!currentStream) return;
-    const track = currentStream.getVideoTracks()[0];
-    const caps = track.getCapabilities ? track.getCapabilities() : {};
-    if (!('torch' in caps)) {
-      alert('Torch not supported on this device.');
-      return;
-    }
-    torchOn = !torchOn;
-    try {
-      await track.applyConstraints({ advanced: [{ torch: torchOn }] });
-      torchBtn.textContent = torchOn ? '🔦 Torch ON' : '🔦 Torch';
-    } catch (e) {
-      alert('Torch toggle failed: ' + e.message);
-    }
-  }
-
-  async function startScan(deviceId) {
-    await stopStream();
-    setStatus('Starting camera…');
-
-    // Build constraints manually (gives us the stream for torch/constraints)
-    const constraints = {
-      audio: false,
-      video: {
-        deviceId: deviceId ? { exact: deviceId } : undefined,
-        facingMode: deviceId ? undefined : { ideal: 'environment' },
-        width: { ideal: 1280 },
-        height: { ideal: 720 }
-      }
-    };
-
-    currentStream = await navigator.mediaDevices.getUserMedia(constraints);
-    videoEl.srcObject = currentStream;
-    await videoEl.play();
-    await applyAdvancedConstraints();
-
-    stopBtn.disabled = false;
-
-    // Enable torch button if supported
-    try {
-      const track = currentStream.getVideoTracks()[0];
-      const caps = track.getCapabilities ? track.getCapabilities() : {};
-      if ('torch' in caps) {
-        torchBtn.disabled = false;
-      } else {
-        torchBtn.disabled = true;
-      }
-    } catch(e) { torchBtn.disabled = true; }
-
-    // Setup ZXing reader with hints
-    codeReader = new ZXing.BrowserMultiFormatReader(hints);
-
-    // Continuous decode loop using video element
-    setStatus('Looking for barcode…');
-    const tick = async () => {
-      if (!codeReader) return;
-      try {
-        const luminanceSource = new ZXing.HTMLCanvasElementLuminanceSource(
-          frameToCanvas(videoEl, scratch)
-        );
-        const binaryBitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminanceSource));
-        const result = codeReader.decode(binaryBitmap);
-        if (result && result.getText) {
-          const text = result.getText();
-          showResult(text);
-          setStatus('Detected ✔');
-          // Optional: beep or auto-stop
-          // await stopStream();
-        } else {
-          requestAnimationFrame(tick);
-        }
-      } catch (err) {
-        // NotFoundException means keep trying
-        if (err && err.name === 'NotFoundException') {
-          requestAnimationFrame(tick);
-        } else {
-          // Other errors, keep trying anyway
-          requestAnimationFrame(tick);
-        }
-      }
-    };
-    requestAnimationFrame(tick);
-  }
-
-  // Draw current video frame into canvas (downscale to speed up)
-  function frameToCanvas(video, canvas) {
-    const maxW = 640; // downscale for speed; increase if small barcodes
-    const ratio = video.videoWidth / video.videoHeight || (16/9);
-    const w = Math.min(maxW, video.videoWidth || maxW);
-    const h = Math.round(w / ratio);
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(video, 0, 0, w, h);
+  function drawROIToCanvas(video, canvas){
+    // Crop to center ROI (speeds up + improves SNR)
+    const vw = video.videoWidth || 1280;
+    const vh = video.videoHeight|| 720;
+    const roi = { x: vw*0.10, y: vh*0.30, w: vw*0.80, h: vh*0.40 };
+    // Downscale to max 720w to keep decode fast
+    const maxW = 720, scale = Math.min(1, maxW/roi.w);
+    canvas.width  = Math.round(roi.w*scale);
+    canvas.height = Math.round(roi.h*scale);
+    const ctx = canvas.getContext('2d',{willReadFrequently:true});
+    ctx.drawImage(video, roi.x, roi.y, roi.w, roi.h, 0, 0, canvas.width, canvas.height);
     return canvas;
   }
 
-  async function scanImageFile(file) {
-    setStatus('Decoding photo…');
-    showResult(''); resultEl.style.display = 'none';
-
-    const img = new Image();
-    img.onload = async () => {
-      // Draw photo onto canvas (downscale if huge)
-      const maxW = 1600;
-      const scale = Math.min(1, maxW / img.width);
-      scratch.width = Math.round(img.width * scale);
-      scratch.height = Math.round(img.height * scale);
-      const ctx = scratch.getContext('2d', { willReadFrequently: true });
-      ctx.drawImage(img, 0, 0, scratch.width, scratch.height);
-
-      try {
-        const luminance = new ZXing.HTMLCanvasElementLuminanceSource(scratch);
-        const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
-        const res = ZXing.MultiFormatReader.decodeWithState(new ZXing.MultiFormatReader());
-        // set hints
-        const reader = new ZXing.MultiFormatReader();
-        reader.setHints(hints);
-        const result = reader.decode(bitmap);
-        showResult(result.getText());
-        setStatus('Photo decoded ✔');
-      } catch (e) {
-        setStatus('No barcode found in photo.');
-        alert('Photo me barcode detect nahi hua. Thoda clear/close photo try karo.');
+  async function tickNative(){
+    if (!running) return;
+    try{
+      const canvas = drawROIToCanvas(video, scratch);
+      const bmp = await createImageBitmap(canvas); // feed image to detector
+      const results = await detector.detect(bmp);
+      if (results && results[0]){
+        showResult(results[0].rawValue || results[0].rawValue);
+        setStatus('Detected ✔ (native)');
+        // optional: await stop();
+      } else {
+        requestAnimationFrame(tickNative);
       }
-    };
-    img.onerror = () => setStatus('Could not load photo.');
-    img.src = URL.createObjectURL(file);
+    }catch(e){
+      requestAnimationFrame(tickNative);
+    }
   }
 
-  startBtn.addEventListener('click', async () => {
-    try {
-      await listCameras();
-      currentDeviceId = cameraSelect.value || null;
-      await startScan(currentDeviceId);
-    } catch (e) {
-      console.error(e);
-      setStatus('Camera start failed: ' + e.message);
-      alert('Camera start failed. Photo se scan try karo.');
+  async function tickZX(){
+    if (!running) return;
+    try{
+      const canvas = drawROIToCanvas(video, scratch);
+      const result = await detector(canvas); // our ZXing wrapper returns string or null
+      if (result){
+        showResult(result);
+        setStatus('Detected ✔ (WASM)');
+        // optional: await stop();
+      } else {
+        requestAnimationFrame(tickZX);
+      }
+    }catch(e){
+      requestAnimationFrame(tickZX);
     }
+  }
+
+  async function start(){
+    await stop();
+    setStatus('Starting camera…');
+    await listCameras();
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio:false,
+      video:{
+        deviceId: camSel.value ? {exact: camSel.value} : undefined,
+        facingMode: camSel.value ? undefined : {ideal:'environment'},
+        width:{ideal:1920}, height:{ideal:1080} // high res improves decode
+      }
+    });
+    video.srcObject = stream;
+    await video.play();
+    await applyTrackTuning();
+    stopBtn.disabled = false;
+
+    // Try native BarcodeDetector first
+    useNative = 'BarcodeDetector' in window;
+    if (useNative){
+      try{
+        detector = new window.BarcodeDetector({ formats: wantedFormatsNative });
+        setStatus('Scanning (native)…');
+        running = true;
+        requestAnimationFrame(tickNative);
+        return;
+      }catch{ useNative = false; }
+    }
+
+    // Fallback: ZXing WASM (loads on demand)
+    setStatus('Loading fast decoder (WASM)…');
+    const { default: ZXing } = await import('https://cdn.jsdelivr.net/npm/zxing-wasm@2.2.3/dist/reader.min.js');
+    const z = await ZXing();
+    // Pre-configure to our formats for speed
+    const Hints = z.BarcodeReader.Hints;
+    const hints = new Hints();
+    wantedFormatsZX.forEach(f => hints.set(z.BarcodeFormat[f], true));
+    const reader = new z.BarcodeReader();
+    reader.setHints(hints);
+
+    detector = async (canvas) => {
+      const luminance = z.ImageWrapper.createFromCanvas(canvas);
+      const res = reader.decodeBitmap(luminance);
+      return res?.text || null;
+    };
+
+    setStatus('Scanning (WASM)…');
+    running = true;
+    requestAnimationFrame(tickZX);
+  }
+
+  startBtn.addEventListener('click', start);
+  stopBtn.addEventListener('click', stop);
+  camSel.addEventListener('change', () => { if (stream) start(); });
+  torchBtn.addEventListener('click', async () => {
+    if (!stream) return;
+    const track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities?.() || {};
+    if (!('torch' in caps)) return alert('Torch not supported');
+    torchOn = !torchOn;
+    try{ await track.applyConstraints({advanced:[{torch:torchOn}]}); }catch(e){}
+    torchBtn.textContent = torchOn ? '🔦 Torch ON' : '🔦 Torch';
   });
 
-  stopBtn.addEventListener('click', stopStream);
-  torchBtn.addEventListener('click', toggleTorch);
-
-  cameraSelect.addEventListener('change', async (e) => {
-    currentDeviceId = e.target.value;
-    if (currentStream) await startScan(currentDeviceId);
-  });
-
-  scanPhotoBtn.addEventListener('click', async () => {
-    const f = photoInput.files && photoInput.files[0];
-    if (!f) { alert('Choose a photo first.'); return; }
-    await scanImageFile(f);
-  });
-
-  // iOS/Safari autoplay helper
-  document.addEventListener('touchstart', () => { if (videoEl.paused) videoEl.play().catch(()=>{}); }, { once:true });
-
+  // iOS autoplay helper
+  document.addEventListener('touchstart', () => { if (video.paused) video.play().catch(()=>{}); }, { once:true });
 })();
 </script>
 </body>
